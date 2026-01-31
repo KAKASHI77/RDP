@@ -1,53 +1,93 @@
-𓆰𝐒𝐂𝐀𝐑𝐘 𝐆♕𝐃𓆪, [29-01-2026 11:26 PM]
 name: NOBIXRDP
 
 on:
   workflow_dispatch:
 
 jobs:
-  secure-rdp:
+  rdp:
     runs-on: windows-latest
 
     steps:
+
+    # ------------------------------------------------------------
+    # Allocate RDP Slot + Enforce Max 5 RDP
+    # ------------------------------------------------------------
+    - name: Allocate RDP Slot
+      shell: pwsh
+      run: |
+        $headers = @{
+          Authorization = "Bearer ${{ secrets.GH_TRIGGER_TOKEN }}"
+          Accept        = "application/vnd.github+json"
+        }
+
+        $repo = "${{ github.repository }}"
+
+        # Get all in-progress runs
+        $runs = Invoke-RestMethod `
+          -Headers $headers `
+          -Uri "https://api.github.com/repos/$repo/actions/runs?status=in_progress"
+
+        # Filter only NOBIXRDP workflow
+        $active = $runs.workflow_runs | Where-Object {
+          $_.name -eq "NOBIXRDP"
+        }
+
+        if ($active.Count -ge 5) {
+          $oldest = $active | Sort-Object created_at | Select-Object -First 1
+
+          # Cancel oldest
+          Invoke-RestMethod `
+            -Method POST `
+            -Headers $headers `
+            -Uri "https://api.github.com/repos/$repo/actions/runs/$($oldest.id)/cancel"
+
+          # Telegram alert
+          $bot="${{ secrets.TG_BOT_TOKEN }}"
+          $chat="${{ secrets.TG_CHAT_ID }}"
+          $msg="🧹 **OLD RDP CANCELLED**%0A🔢 Run ID: $($oldest.id)"
+          Invoke-RestMethod "https://api.telegram.org/bot$bot/sendMessage?chat_id=$chat&text=$msg"
+        }
+
+        # Assign new slot number
+        $slot = ($active.Count % 5) + 1
+        echo "RDP_SLOT=RDP-$slot" >> $env:GITHUB_ENV
+
     # ------------------------------------------------------------
     # Enable RDP + Firewall
     # ------------------------------------------------------------
-    - name: Configure RDP
+    - name: Enable RDP
       run: |
-        Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name fDenyTSConnections -Value 0
-        Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name UserAuthentication -Value 0
-        netsh advfirewall firewall add rule name="NOBIXRDP" dir=in action=allow protocol=TCP localport=3389
+        Set-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server' fDenyTSConnections 0
+        netsh advfirewall firewall add rule name="RDP" dir=in action=allow protocol=TCP localport=3389
         Restart-Service TermService -Force
+
     # ------------------------------------------------------------
-    # Create User (FIXED PASSWORD)
+    # Create User (Fixed Password)
     # ------------------------------------------------------------
-    - name: Create RDP User
+    - name: Create User
       run: |
-        $pass = "${{ secrets.RDP_PASSWORD }}"
-        $secure = ConvertTo-SecureString $pass -AsPlainText -Force
-        if (Get-LocalUser -Name "NOBIXRDP" -ErrorAction SilentlyContinue) {
-          Set-LocalUser -Name "NOBIXRDP" -Password $secure
+        $pass="${{ secrets.RDP_PASSWORD }}"
+        $sec=ConvertTo-SecureString $pass -AsPlainText -Force
+
+        if (Get-LocalUser NOBIXRDP -ErrorAction SilentlyContinue) {
+          Set-LocalUser NOBIXRDP -Password $sec
         } else {
-          New-LocalUser -Name "NOBIXRDP" -Password $secure -AccountNeverExpires
-          Add-LocalGroupMember -Group "Administrators" -Member "NOBIXRDP"
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "NOBIXRDP"
+          New-LocalUser NOBIXRDP -Password $sec -AccountNeverExpires
+          Add-LocalGroupMember Administrators NOBIXRDP
+          Add-LocalGroupMember "Remote Desktop Users" NOBIXRDP
         }
+
         echo "RDP_USER=NOBIXRDP" >> $env:GITHUB_ENV
-        echo "RDP_PASS=$pass" >> $env:GITHUB_ENV
+
     # ------------------------------------------------------------
-    # Install Tailscale
+    # Install + Connect Tailscale
     # ------------------------------------------------------------
-    - name: Install Tailscale
+    - name: Tailscale
       run: |
-        $url="https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
-        $path="$env:TEMP\tailscale.msi"
-        Invoke-WebRequest $url -OutFile $path
-        Start-Process msiexec.exe -ArgumentList "/i "$path" /quiet" -Wait
-    # ------------------------------------------------------------
-    # Tailscale UP
-    # ------------------------------------------------------------
-    - name: Tailscale Up
-      run: |
+        $u="https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+        $p="$env:TEMP\tailscale.msi"
+        Invoke-WebRequest $u -OutFile $p
+        Start-Process msiexec "/i `"$p`" /quiet" -Wait
         & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }}
         $ip=""
         while (-not $ip) {
@@ -55,42 +95,53 @@ jobs:
           Start-Sleep 5
         }
         echo "TAILSCALE_IP=$ip" >> $env:GITHUB_ENV
-    # ------------------------------------------------------------
-    # Send NEW RDP details to Telegram
-    # ------------------------------------------------------------
-    - name: Telegram RDP Details
-      run: |
-        $bot="${{ secrets.TG_BOT_TOKEN }}"
-        $chat="${{ secrets.TG_CHAT_ID }}"
-        $msg="🟢 NEW RDP READY 🟢%0A%0A🖥 IP: $env:TAILSCALE_IP%0A👤 User: $env:RDP_USER%0A🔐 Pass: FIXED"
-        Invoke-WebRequest "https://api.telegram.org/bot$bot/sendMessage?chat_id=$chat&text=$msg"
-    # ------------------------------------------------------------
-    # /stoprdp COMMAND LISTENER + AUTO NEW RDP
-    # ------------------------------------------------------------
-    - name: Telegram Stop Listener
-      run: |
-        $bot="${{ secrets.TG_BOT_TOKEN }}"
-        $chat="${{ secrets.TG_CHAT_ID }}"
-        $offset=0
-        while ($true) {
-          $updates=Invoke-RestMethod "https://api.telegram.org/bot$bot/getUpdates?offset=$offset"
-          foreach ($u in $updates.result) {
-            $offset=$u.update_id+1
-            if ($u.message.text -eq "/stoprdp") {
-              Invoke-WebRequest "https://api.telegram.org/bot$bot/sendMessage?chat_id=$chat&text=🛑 RDP STOPPED. NEW RDP STARTING..."
-              $headers=@{
-                Authorization="Bearer ${{ secrets.GH_TRIGGER_TOKEN }}"
-                Accept="application/vnd.github+json"
-              }
-              Invoke-RestMethod `
-                -Method POST `
-                -Headers $headers `
-                -Uri "https://api.github.com/repos/${{ github.repository }}/actions/workflows/NOBIXRDP.yml/dispatches" `
 
-𓆰𝐒𝐂𝐀𝐑𝐘 𝐆♕𝐃𓆪, [29-01-2026 11:26 PM]
--Body '{"ref":"main"}'
-              exit 0
-            }
-          }
-          Start-Sleep 5
-        }
+    # ------------------------------------------------------------
+    # Telegram Alert: NEW RDP
+    # ------------------------------------------------------------
+    - name: Telegram New RDP
+      run: |
+        $bot="${{ secrets.TG_BOT_TOKEN }}"
+        $chat="${{ secrets.TG_CHAT_ID }}"
+        $msg="🟢 **NEW RDP READY**%0A%0A🔢 $env:RDP_SLOT%0A🖥 IP: $env:TAILSCALE_IP%0A👤 User: NOBIXRDP%0A🔐 Pass: FIXED%0A⏳ Expiry: 6 HOURS"
+        Invoke-RestMethod "https://api.telegram.org/bot$bot/sendMessage?chat_id=$chat&text=$msg"
+
+    # ------------------------------------------------------------
+    # RDP Lifetime + Expiry Alert + Auto Renew
+    # ------------------------------------------------------------
+    - name: RDP Lifetime & Auto-Renew
+      shell: pwsh
+      run: |
+        $bot="${{ secrets.TG_BOT_TOKEN }}"
+        $chat="${{ secrets.TG_CHAT_ID }}"
+        $repo="${{ github.repository }}"
+        $wf="NOBIXRDP.yml"
+        $token="${{ secrets.GH_TRIGGER_TOKEN }}"
+
+        # Wait 5h45m
+        Start-Sleep 20700
+
+        # 15 min warning
+        Invoke-RestMethod "https://api.telegram.org/bot$bot/sendMessage?chat_id=$chat&text=⏰ WARNING%0A$env:RDP_SLOT will expire in 15 minutes"
+
+        # Wait final 15 min
+        Start-Sleep 900
+
+        # Expired alert
+        Invoke-RestMethod "https://api.telegram.org/bot$bot/sendMessage?chat_id=$chat&text=🔴 RDP EXPIRED%0A$env:RDP_SLOT is now offline"
+
+        # ------------------------------------------------------
+        # Auto-Renew: Trigger new workflow_dispatch
+        # ------------------------------------------------------
+        $body = @{ 
+          ref = "${{ github.ref }}" 
+        } | ConvertTo-Json
+
+        Invoke-RestMethod `
+          -Method POST `
+          -Uri "https://api.github.com/repos/$repo/actions/workflows/$wf/dispatches" `
+          -Headers @{
+            Authorization = "Bearer $token"
+            Accept = "application/vnd.github+json"
+          } `
+          -Body $body
