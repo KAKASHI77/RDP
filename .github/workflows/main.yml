@@ -1,1 +1,96 @@
+𓆰𝐒𝐂𝐀𝐑𝐘 𝐆♕𝐃𓆪, [29-01-2026 11:26 PM]
+name: NOBIXRDP
 
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+
+    steps:
+    # ------------------------------------------------------------
+    # Enable RDP + Firewall
+    # ------------------------------------------------------------
+    - name: Configure RDP
+      run: |
+        Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name fDenyTSConnections -Value 0
+        Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name UserAuthentication -Value 0
+        netsh advfirewall firewall add rule name="NOBIXRDP" dir=in action=allow protocol=TCP localport=3389
+        Restart-Service TermService -Force
+    # ------------------------------------------------------------
+    # Create User (FIXED PASSWORD)
+    # ------------------------------------------------------------
+    - name: Create RDP User
+      run: |
+        $pass = "${{ secrets.RDP_PASSWORD }}"
+        $secure = ConvertTo-SecureString $pass -AsPlainText -Force
+        if (Get-LocalUser -Name "NOBIXRDP" -ErrorAction SilentlyContinue) {
+          Set-LocalUser -Name "NOBIXRDP" -Password $secure
+        } else {
+          New-LocalUser -Name "NOBIXRDP" -Password $secure -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "NOBIXRDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "NOBIXRDP"
+        }
+        echo "RDP_USER=NOBIXRDP" >> $env:GITHUB_ENV
+        echo "RDP_PASS=$pass" >> $env:GITHUB_ENV
+    # ------------------------------------------------------------
+    # Install Tailscale
+    # ------------------------------------------------------------
+    - name: Install Tailscale
+      run: |
+        $url="https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+        $path="$env:TEMP\tailscale.msi"
+        Invoke-WebRequest $url -OutFile $path
+        Start-Process msiexec.exe -ArgumentList "/i "$path" /quiet" -Wait
+    # ------------------------------------------------------------
+    # Tailscale UP
+    # ------------------------------------------------------------
+    - name: Tailscale Up
+      run: |
+        & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }}
+        $ip=""
+        while (-not $ip) {
+          $ip=& "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+          Start-Sleep 5
+        }
+        echo "TAILSCALE_IP=$ip" >> $env:GITHUB_ENV
+    # ------------------------------------------------------------
+    # Send NEW RDP details to Telegram
+    # ------------------------------------------------------------
+    - name: Telegram RDP Details
+      run: |
+        $bot="${{ secrets.TG_BOT_TOKEN }}"
+        $chat="${{ secrets.TG_CHAT_ID }}"
+        $msg="🟢 NEW RDP READY 🟢%0A%0A🖥 IP: $env:TAILSCALE_IP%0A👤 User: $env:RDP_USER%0A🔐 Pass: FIXED"
+        Invoke-WebRequest "https://api.telegram.org/bot$bot/sendMessage?chat_id=$chat&text=$msg"
+    # ------------------------------------------------------------
+    # /stoprdp COMMAND LISTENER + AUTO NEW RDP
+    # ------------------------------------------------------------
+    - name: Telegram Stop Listener
+      run: |
+        $bot="${{ secrets.TG_BOT_TOKEN }}"
+        $chat="${{ secrets.TG_CHAT_ID }}"
+        $offset=0
+        while ($true) {
+          $updates=Invoke-RestMethod "https://api.telegram.org/bot$bot/getUpdates?offset=$offset"
+          foreach ($u in $updates.result) {
+            $offset=$u.update_id+1
+            if ($u.message.text -eq "/stoprdp") {
+              Invoke-WebRequest "https://api.telegram.org/bot$bot/sendMessage?chat_id=$chat&text=🛑 RDP STOPPED. NEW RDP STARTING..."
+              $headers=@{
+                Authorization="Bearer ${{ secrets.GH_TRIGGER_TOKEN }}"
+                Accept="application/vnd.github+json"
+              }
+              Invoke-RestMethod `
+                -Method POST `
+                -Headers $headers `
+                -Uri "https://api.github.com/repos/${{ github.repository }}/actions/workflows/NOBIXRDP.yml/dispatches" `
+
+𓆰𝐒𝐂𝐀𝐑𝐘 𝐆♕𝐃𓆪, [29-01-2026 11:26 PM]
+-Body '{"ref":"main"}'
+              exit 0
+            }
+          }
+          Start-Sleep 5
+        }
